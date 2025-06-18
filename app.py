@@ -7,6 +7,7 @@ import pygeohash as pgh
 
 app = Flask(__name__)
 app.config['UPLOAD_FOLDER'] = 'uploads'
+CHUNK_SIZE = 10000
 
 def geohash_to_polygon(geohash):
     bbox = pgh.decode_exactly(geohash)
@@ -76,56 +77,64 @@ def map_view():
     file_path = os.path.join(app.config['UPLOAD_FOLDER'], file.filename)
     file.save(file_path)
     
-    data_frame = pd.read_csv(file_path)
-    data_frame = data_frame.apply(lambda col: pd.to_numeric(col.replace(',', '', regex=True), errors='coerce') if col.name != 'geohash' else col)
-    column_names = data_frame.columns.tolist()
-    print(data_frame.dtypes)
-    
-    if 'geohash' in column_names:
-        column_names.remove('geohash')
+    chunks = pd.read_csv(file_path, chunksize=CHUNK_SIZE)
 
-    # Calculate the bounding box (min/max lat and lon)
+    column_names = None
     lats = []
     lons = []
-    
-    for idx, row in data_frame.iterrows():
-        geohash = row['geohash']
-        polygon_points = geohash_to_polygon(geohash)
-        for lat, lon in polygon_points:
-            lats.append(lat)
-            lons.append(lon)
-    
+    polygons = []
+    metric_values = []
+
+    for chunk in chunks:
+        chunk = chunk.apply(lambda col: pd.to_numeric(col.replace(',', '', regex=True), errors='coerce') if col.name != 'geohash' else col)
+
+        if column_names is None:
+            column_names = chunk.columns.tolist()
+            if 'geohash' in column_names:
+                column_names.remove('geohash')
+
+        for _, row in chunk.iterrows():
+            geohash = row['geohash']
+            polygon_points = geohash_to_polygon(geohash)
+            for lat, lon in polygon_points:
+                lats.append(lat)
+                lons.append(lon)
+
+            metric_value = row[metric] if metric and metric in row else 0
+            polygons.append({'geohash': geohash,
+                             'points': polygon_points,
+                             'metric_value': metric_value})
+            metric_values.append(metric_value)
+
     if not lats or not lons:
         return jsonify({'error': 'Invalid geohash data.'}), 400
 
-    # Calculate centroid
     min_lat, max_lat = min(lats), max(lats)
     min_lon, max_lon = min(lons), max(lons)
     center_lat = (min_lat + max_lat) / 2
     center_lon = (min_lon + max_lon) / 2
-    
-    
+
     print("Columns in DataFrame:", column_names)
-    
+
+    metric_df = pd.DataFrame({metric: metric_values}) if metric else pd.DataFrame()
+
     m = folium.Map(location=[center_lat, center_lon], zoom_start=8)
-    
-    for idx, row in data_frame.iterrows():
-        geohash = row['geohash']
-        
 
-        if metric is None or metric not in data_frame.columns:
+    for idx, item in enumerate(polygons):
+        geohash = item['geohash']
+        metric_value = item['metric_value']
+        polygon_points = item['points']
+
+        if metric is None or metric not in metric_df.columns:
             print(f"Invalid metric: {metric}")
-            continue  
-        
-        metric_value = row[metric] if metric in row else 0  
-        
-        
-        print(f"Row {idx}, Geohash: {geohash}, Metric: {metric}, Metric Value: {metric_value}")
+            fill_color = 'gray'
+        else:
+            fill_color = get_color(metric_df, metric_value, metric)
 
-        fill_color = get_color(data_frame, metric_value, metric)
-        polygon_points = geohash_to_polygon(geohash)
-        tooltip_text = f'Geohash: {geohash}<br>{metric.replace("_", " ").title()}: {metric_value:.2f}'
-        
+        tooltip_text = f'Geohash: {geohash}'
+        if metric:
+            tooltip_text += f'<br>{metric.replace("_", " ").title()}: {metric_value:.2f}'
+
         folium.Polygon(
             locations=polygon_points,
             color='black',
